@@ -15,15 +15,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -32,6 +31,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
@@ -47,14 +47,12 @@ import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 
-// Projection reference point, roughly the middle of the Scottish Highlands.
 private const val LAT_REF = 57.3
 private const val LON_REF = -4.6
 private const val KM_PER_DEG_LAT = 110.57
 
 private val kmPerDegLon = 111.32 * cos(Math.toRadians(LAT_REF))
 
-/** Projects lat/lon onto a flat plane measured in kilometres. Good enough for Scotland. */
 private fun projectX(lon: Double): Float = ((lon - LON_REF) * kmPerDegLon).toFloat()
 private fun projectY(lat: Double): Float = (-(lat - LAT_REF) * KM_PER_DEG_LAT).toFloat()
 
@@ -67,19 +65,20 @@ fun MapScreen(
     fix: Fix?,
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
+    bagged: Set<Int>,
+    onToggleBagged: (Int) -> Unit,
     modifier: Modifier = Modifier,
-) {
+    ) {
     val surface = MaterialTheme.colorScheme.surface
     val onSurface = MaterialTheme.colorScheme.onSurface
     val primary = MaterialTheme.colorScheme.primary
 
-    var scale by remember { mutableFloatStateOf(0f) } // 0 = not yet fitted
+    var scale by remember { mutableFloatStateOf(0f) }
     var panX by remember { mutableFloatStateOf(0f) }
     var panY by remember { mutableFloatStateOf(0f) }
     var selected by remember { mutableStateOf<Munro?>(null) }
     var canvasSize by remember { mutableStateOf(Size.Zero) }
 
-    // Cache the projected positions once instead of recomputing every frame.
     val points = remember(munros) {
         munros.map { Triple(it, projectX(it.lon), projectY(it.lat)) }
     }
@@ -94,7 +93,7 @@ fun MapScreen(
         val s = min(
             (size.width - pad * 2) / max(1f, maxX - minX),
             (size.height - pad * 2) / max(1f, maxY - minY),
-        )
+            )
         scale = s
         panX = size.width / 2f - (minX + maxX) / 2f * s
         panY = size.height / 2f - (minY + maxY) / 2f * s
@@ -115,36 +114,35 @@ fun MapScreen(
 
         Canvas(
             modifier = Modifier
-                .fillMaxSize()
-                .onSizeChanged { canvasSize = Size(it.width.toFloat(), it.height.toFloat()) }
-                .pointerInput(points) {
-                    detectTransformGestures { centroid, pan, zoom, _ ->
-                        if (scale <= 0f) return@detectTransformGestures
-                        val newScale = (scale * zoom).coerceIn(MIN_SCALE, MAX_SCALE)
-                        // Keep the point under the fingers fixed while zooming.
-                        val factor = newScale / scale
-                        panX = centroid.x - (centroid.x - panX) * factor + pan.x
-                        panY = centroid.y - (centroid.y - panY) * factor + pan.y
-                        scale = newScale
+            .fillMaxSize()
+            .onSizeChanged { canvasSize = Size(it.width.toFloat(), it.height.toFloat()) }
+            .pointerInput(points) {
+                detectTransformGestures { centroid, pan, zoom, _ ->
+                    if (scale <= 0f) return@detectTransformGestures
+                    val newScale = (scale * zoom).coerceIn(MIN_SCALE, MAX_SCALE)
+                    val factor = newScale / scale
+                    panX = centroid.x - (centroid.x - panX) * factor + pan.x
+                    panY = centroid.y - (centroid.y - panY) * factor + pan.y
+                    scale = newScale
+                }
+            }
+            .pointerInput(points) {
+                detectTapGestures { tap ->
+                    val hit = points.minByOrNull { (_, wx, wy) ->
+                        val sx = wx * scale + panX
+                        val sy = wy * scale + panY
+                        (sx - tap.x) * (sx - tap.x) + (sy - tap.y) * (sy - tap.y)
+                    }
+                    if (hit != null) {
+                        val sx = hit.second * scale + panX
+                        val sy = hit.third * scale + panY
+                        val dist = kotlin.math.hypot(sx - tap.x, sy - tap.y)
+                        selected = if (dist < 48f) hit.first else null
                     }
                 }
-                .pointerInput(points) {
-                    detectTapGestures { tap ->
-                        val hit = points.minByOrNull { (_, wx, wy) ->
-                            val sx = wx * scale + panX
-                            val sy = wy * scale + panY
-                            (sx - tap.x) * (sx - tap.x) + (sy - tap.y) * (sy - tap.y)
-                        }
-                        if (hit != null) {
-                            val sx = hit.second * scale + panX
-                            val sy = hit.third * scale + panY
-                            val dist = kotlin.math.hypot(sx - tap.x, sy - tap.y)
-                            selected = if (dist < 48f) hit.first else null
-                        }
-                    }
-                }
-        ) {
-            drawMunros(points, scale, panX, panY, selected, onSurface, primary)
+            }
+            ) {
+            drawMunros(points, scale, panX, panY, selected, bagged, onSurface, primary)
 
             fix?.let { f ->
                 val sx = projectX(f.lon) * scale + panX
@@ -153,51 +151,48 @@ fun MapScreen(
             }
         }
 
-        // Controls
         Column(
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(12.dp)
-        ) {
+            .align(Alignment.TopEnd)
+            .padding(12.dp)
+            ) {
             FilledTonalButton(
                 onClick = {
                     if (!hasPermission) onRequestPermission()
                     else fix?.let { centreOn(it.lat, it.lon, 14f) }
                 },
                 shape = RoundedCornerShape(12.dp),
-            ) {
+                ) {
                 Text(if (hasPermission) "Centre on me" else "Enable location", fontSize = 13.sp)
             }
             Spacer(Modifier.height(8.dp))
             FilledTonalButton(
                 onClick = { fitAll(canvasSize) },
                 shape = RoundedCornerShape(12.dp),
-            ) {
+                ) {
                 Text("Show all", fontSize = 13.sp)
             }
         }
 
-        // Detail card for the tapped summit
         selected?.let { m ->
             Card(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(12.dp),
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(12.dp),
                 shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(),
-            ) {
+                ) {
                 Column(Modifier.padding(16.dp)) {
                     Text(
                         m.name,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
-                    )
+                        )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${m.heightM.toInt()} m  ·  ${m.heightFt} ft  ·  ${m.gridRef}",
+                        "${m.heightM.toInt()} m - ${m.heightFt} ft - ${m.gridRef}",
                         style = MaterialTheme.typography.bodyMedium,
-                    )
+                        )
                     Text(m.region, style = MaterialTheme.typography.bodySmall)
                     fix?.let { f ->
                         val d = haversineKm(f.lat, f.lon, m.lat, m.lon)
@@ -206,19 +201,26 @@ fun MapScreen(
                             "${formatDistance(d)} away, straight line",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium,
-                        )
+                            )
                     }
                     Spacer(Modifier.height(10.dp))
                     Row {
                         FilledTonalButton(
+                            onClick = { onToggleBagged(m.id) },
+                            shape = RoundedCornerShape(12.dp),
+                            ) {
+                            Text(if (m.id in bagged) "Climbed" else "Mark climbed", fontSize = 13.sp)
+                        }
+                        Spacer(Modifier.size(8.dp))
+                        FilledTonalButton(
                             onClick = { centreOn(m.lat, m.lon, 25f) },
                             shape = RoundedCornerShape(12.dp),
-                        ) { Text("Zoom to summit", fontSize = 13.sp) }
+                            ) { Text("Zoom", fontSize = 13.sp) }
                         Spacer(Modifier.size(8.dp))
                         FilledTonalButton(
                             onClick = { selected = null },
                             shape = RoundedCornerShape(12.dp),
-                        ) { Text("Close", fontSize = 13.sp) }
+                            ) { Text("Close", fontSize = 13.sp) }
                     }
                 }
             }
@@ -232,9 +234,10 @@ private fun DrawScope.drawMunros(
     panX: Float,
     panY: Float,
     selected: Munro?,
+    bagged: Set<Int>,
     baseColor: Color,
     accent: Color,
-) {
+    ) {
     val showLabels = scale > 8f
     val paint = android.graphics.Paint().apply {
         color = baseColor.copy(alpha = 0.85f).toArgb()
@@ -245,33 +248,38 @@ private fun DrawScope.drawMunros(
     points.forEach { (munro, wx, wy) ->
         val sx = wx * scale + panX
         val sy = wy * scale + panY
-        // Skip anything well outside the viewport.
         if (sx < -80f || sy < -80f || sx > size.width + 80f || sy > size.height + 80f) return@forEach
 
         val isSelected = munro.id == selected?.id
-        // Bigger dot for a bigger hill, within reason.
+        val isBagged = munro.id in bagged
         val radius = (3.5f + ((munro.heightM - 900.0) / 120.0).toFloat()).coerceIn(3.5f, 8f)
+        val r = if (isSelected) radius * 1.9f else radius
 
-        drawCircle(
-            color = if (isSelected) accent else baseColor.copy(alpha = 0.55f),
-            radius = if (isSelected) radius * 1.9f else radius,
-            center = Offset(sx, sy),
-        )
+        if (isBagged) {
+            drawCircle(
+                color = if (isSelected) accent else accent.copy(alpha = 0.9f),
+                radius = r,
+                center = Offset(sx, sy),
+                style = Stroke(width = 2.2f),
+                )
+        } else {
+            drawCircle(
+                color = if (isSelected) accent else baseColor.copy(alpha = 0.55f),
+                radius = r,
+                center = Offset(sx, sy),
+                )
+        }
+
         if (isSelected) {
             drawCircle(
                 color = accent.copy(alpha = 0.3f),
                 radius = radius * 4f,
                 center = Offset(sx, sy),
-            )
+                )
         }
 
         if (showLabels || isSelected) {
-            drawContext.canvas.nativeCanvas.drawText(
-                munro.name,
-                sx + radius + 8f,
-                sy + 10f,
-                paint,
-            )
+            drawContext.canvas.nativeCanvas.drawText(munro.name, sx + radius + 8f, sy + 10f, paint)
         }
     }
 }
@@ -281,15 +289,14 @@ private fun DrawScope.drawLocationDot(
     accuracyM: Float,
     scale: Float,
     accent: Color,
-) {
-    // Accuracy circle, drawn in real-world kilometres so it scales with the map.
+    ) {
     val accuracyRadiusPx = (accuracyM / 1000f) * scale
     if (accuracyRadiusPx > 6f) {
         drawCircle(
             color = accent.copy(alpha = 0.15f),
             radius = accuracyRadiusPx,
             center = centre,
-        )
+            )
     }
     drawCircle(color = Color.White, radius = 11f, center = centre)
     drawCircle(color = accent, radius = 8f, center = centre)
