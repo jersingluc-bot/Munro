@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import uk.munromap.data.BagStore
 import uk.munromap.data.Fix
 import uk.munromap.data.LocationSource
 import uk.munromap.data.MunroRepository
@@ -43,7 +44,7 @@ private val HillScheme = darkColorScheme(
     onSurfaceVariant = Color(0xFFCADAE2),
     secondaryContainer = Color(0xFF274038),
     onSecondaryContainer = Color(0xFFD5EDE2),
-)
+    )
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -61,6 +62,8 @@ class MainActivity : ComponentActivity() {
 private fun MunroApp() {
     val context = LocalContext.current
     val munros = remember { MunroRepository.load(context) }
+    val bagStore = remember { BagStore(context) }
+    var bagged by remember { mutableStateOf(bagStore.load()) }
 
     var hasPermission by remember { mutableStateOf(LocationSource.hasPermission(context)) }
     var fix by remember { mutableStateOf<Fix?>(null) }
@@ -68,7 +71,7 @@ private fun MunroApp() {
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { granted ->
+        ) { granted ->
         hasPermission = granted.values.any { it }
     }
 
@@ -81,36 +84,32 @@ private fun MunroApp() {
     Scaffold { insets ->
         Column(Modifier.fillMaxSize().padding(insets)) {
             TabRow(selectedTabIndex = tab) {
-                Tab(
-                    selected = tab == 0,
-                    onClick = { tab = 0 },
-                    text = { Text("Map") },
-                )
-                Tab(
-                    selected = tab == 1,
-                    onClick = { tab = 1 },
-                    text = { Text("Nearest") },
-                )
+                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Map") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Nearest") })
             }
             when (tab) {
                 0 -> MapScreen(
                     munros = munros,
                     fix = fix,
                     hasPermission = hasPermission,
+                    bagged = bagged,
+                    onToggleBagged = { id -> bagged = bagStore.toggle(bagged, id) },
                     onRequestPermission = {
                         permissionLauncher.launch(
                             arrayOf(
                                 Manifest.permission.ACCESS_FINE_LOCATION,
                                 Manifest.permission.ACCESS_COARSE_LOCATION,
+                                )
                             )
-                        )
                     },
-                )
+                    )
                 else -> NearbyScreen(
                     munros = munros,
                     fix = fix,
                     hasPermission = hasPermission,
-                )
+                    bagged = bagged,
+                    onToggleBagged = { id -> bagged = bagStore.toggle(bagged, id) },
+                    )
             }
         }
     }
