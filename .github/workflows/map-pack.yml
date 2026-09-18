@@ -1,0 +1,155 @@
+name: Build map pack
+
+# Not run automatically — this is heavy (about an hour) and only needs
+# rebuilding when the source data changes. Start it from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      max_zoom:
+        description: 'Maximum zoom level (12 is fast, 13 is sharper but ~4x bigger)'
+        required: true
+        default: '12'
+
+jobs:
+  build-tiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Install GDAL and osmium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdal-bin osmium-tool python3-gdal
+          gdalinfo --version
+          osmium --version
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      # ---------------------------------------------------------------
+      # 1. Elevation. Copernicus GLO-30 is open data on S3, no login.
+      #    Scotland spans roughly N55-N58, W001-W008.
+      # ---------------------------------------------------------------
+      - name: Download elevation tiles
+        run: |
+          mkdir -p dem
+          base=https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com
+          for lat in 55 56 57 58; do
+            for lon in 01 02 03 04 05 06 07 08; do
+              name=Copernicus_DSM_COG_10_N${lat}_00_W0${lon}_00_DEM
+              # Ocean-only squares don't exist; skip them quietly.
+              curl -sfL "$base/$name/$name.tif" -o "dem/$name.tif" \
+                && echo "got $name" || true
+            done
+          done
+          ls dem | wc -l
+          du -sh dem
+
+      - name: Merge and reproject to Web Mercator
+        run: |
+          gdalbuildvrt dem.vrt dem/*.tif
+          gdalwarp -t_srs EPSG:3857 -r bilinear -tr 30 30 \
+            -co COMPRESS=DEFLATE -co BIGTIFF=YES \
+            dem.vrt dem_3857.tif
+          gdalinfo dem_3857.tif | head -20
+
+      # ---------------------------------------------------------------
+      # 2. Shaded relief — this is what makes the terrain readable.
+      # ---------------------------------------------------------------
+      - name: Generate hillshade
+        run: |
+          gdaldem hillshade -z 2.5 -az 315 -alt 45 -compute_edges \
+            -co COMPRESS=DEFLATE -co BIGTIFF=YES \
+            dem_3857.tif hillshade.tif
+          # Convert greyscale to RGB so we can burn coloured lines onto it.
+          gdal_translate -expand rgb -co COMPRESS=DEFLATE -co BIGTIFF=YES \
+            hillshade.tif basemap.tif
+
+      # ---------------------------------------------------------------
+      # 3. Contours every 50 m, burnt onto the hillshade.
+      # ---------------------------------------------------------------
+      - name: Generate and burn contours
+        run: |
+          gdal_contour -a elev -i 50.0 dem_3857.tif contours.gpkg
+          ogrinfo -so contours.gpkg contour | head -10
+          gdal_rasterize -burn 120 -burn 90 -burn 60 -l contour \
+            contours.gpkg basemap.tif
+
+      # ---------------------------------------------------------------
+      # 4. Footpaths from OpenStreetMap, burnt on in a contrasting colour.
+      #    Geofabrik extracts are ODbL — attribution is in the app.
+      # ---------------------------------------------------------------
+      - name: Download and burn the OSM path network
+        run: |
+          curl -sfL -o scotland.osm.pbf \
+            https://download.geofabrik.de/europe/united-kingdom/scotland-latest.osm.pbf
+          ls -lh scotland.osm.pbf
+
+          osmium tags-filter scotland.osm.pbf \
+            w/highway=path,footway,track,bridleway,steps \
+            -o paths.osm.pbf --overwrite
+
+          ogr2ogr -f GPKG paths.gpkg paths.osm.pbf lines \
+            -t_srs EPSG:3857 -nln paths
+          ogrinfo -so paths.gpkg paths | head -10
+
+          gdal_rasterize -burn 200 -burn 60 -burn 40 -l paths \
+            paths.gpkg basemap.tif
+
+      # ---------------------------------------------------------------
+      # 5. Cut into XYZ tiles, then pack into a single MBTiles file.
+      # ---------------------------------------------------------------
+      - name: Cut tiles
+        run: |
+          gdal2tiles.py --xyz --zoom=7-${{ inputs.max_zoom }} \
+            --processes=4 --resampling=average -w none \
+            basemap.tif tiles/
+          du -sh tiles
+
+      - name: Pack into MBTiles
+        run: |
+          python3 - <<'PY'
+          import os, sqlite3, glob
+          con = sqlite3.connect("scotland.mbtiles")
+          cur = con.cursor()
+          cur.execute("CREATE TABLE metadata (name text, value text)")
+          cur.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, "
+                      "tile_row integer, tile_data blob)")
+          for k, v in [("name", "Scotland hill map"), ("format", "png"),
+                       ("type", "baselayer"), ("version", "1"),
+                       ("description", "Hillshade, 50 m contours and OSM paths")]:
+              cur.execute("INSERT INTO metadata VALUES (?,?)", (k, v))
+          n = 0
+          for path in glob.glob("tiles/*/*/*.png"):
+              z, x, y = path.split(os.sep)[1:4]
+              z, x = int(z), int(x)
+              y = int(y.removesuffix(".png"))
+              # gdal2tiles --xyz writes top-left origin; MBTiles wants bottom-left.
+              tms_y = (1 << z) - 1 - y
+              with open(path, "rb") as fh:
+                  cur.execute("INSERT INTO tiles VALUES (?,?,?,?)",
+                              (z, x, tms_y, fh.read()))
+              n += 1
+          cur.execute("CREATE UNIQUE INDEX tile_index ON tiles "
+                      "(zoom_level, tile_column, tile_row)")
+          con.commit()
+          con.close()
+          print(f"packed {n} tiles")
+          PY
+          ls -lh scotland.mbtiles
+
+      - name: Publish as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: map-pack-z${{ inputs.max_zoom }}
+          name: Scotland map pack (zoom 7-${{ inputs.max_zoom }})
+          body: |
+            Hillshade, 50 m contours and the OpenStreetMap footpath network
+            for Scotland, as a single MBTiles file the app downloads on first run.
+
+            Elevation: Copernicus GLO-30 DEM.
+            Paths: OpenStreetMap contributors, ODbL.
+          files: scotland.mbtiles
+          fail_on_unmatched_files: true
