@@ -62,17 +62,36 @@ jobs:
       # ---------------------------------------------------------------
       # 2. Shaded relief — this is what makes the terrain readable.
       # ---------------------------------------------------------------
-      - name: Generate hillshade
+      - name: Generate shaded colour relief
         run: |
           gdaldem hillshade -z 2.5 -az 315 -alt 45 -compute_edges \
             -co COMPRESS=DEFLATE -co BIGTIFF=YES \
             dem_3857.tif hillshade.tif
-          # Copy the single grey band three times to make an RGB image we can
-          # burn coloured lines onto. (-expand rgb only works on palettes.)
-          # Left uncompressed and tiled: gdal_rasterize edits this file in
-          # place later, which is unreliable on a compressed TIFF.
-          gdal_translate -b 1 -b 1 -b 1 -co TILED=YES -co BIGTIFF=YES \
-            hillshade.tif basemap.tif
+
+          # Height-tinted colours: sea, low green, moor, rock, snow. Without
+          # this the map is pure greyscale and markers vanish into it.
+          cat > ramp.txt <<'RAMP'
+          -10  38  58  74
+          0    46  74  62
+          1    74 104  72
+          150  96 120  78
+          350 124 124  84
+          600 142 122  92
+          850 160 148 132
+          1100 196 196 198
+          1345 236 240 244
+          nv   0   0   0
+          RAMP
+
+          gdaldem color-relief dem_3857.tif ramp.txt colour.tif \
+            -co COMPRESS=DEFLATE -co BIGTIFF=YES
+
+          # Multiply colours by the hillshade so relief still reads. Output is
+          # uncompressed and tiled: gdal_rasterize edits it in place later,
+          # which is unreliable on a compressed TIFF.
+          gdal_calc.py -A colour.tif -B hillshade.tif --allBands=A \
+            --calc="A*(0.40+0.60*B/255.0)" --type=Byte --NoDataValue=none \
+            --co TILED=YES --co BIGTIFF=YES --outfile=basemap.tif
           df -h /
 
       # ---------------------------------------------------------------
