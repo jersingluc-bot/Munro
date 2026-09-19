@@ -61,6 +61,12 @@ import kotlin.math.min
 private const val TILE_PX = 256.0
 
 // Scotland only: no point letting the user pan to Australia.
+// Marker colours, chosen to hold up over pale hillshade and dark ground alike.
+private val TO_CLIMB = Color(0xFFFF8A3D)   // amber - not yet climbed
+private val CLIMBED = Color(0xFF6FE3A8)    // green - climbed
+private val SELECTED = Color(0xFFFFD24A)   // yellow - currently tapped
+private val OUTLINE = Color(0xFF12191D)    // near-black ring behind every marker
+
 private const val MIN_SCALE = 4_000f
 private const val MAX_SCALE = 8_000_000f
 
@@ -76,7 +82,6 @@ fun MapScreen(
     modifier: Modifier = Modifier,
 ) {
     val surface = MaterialTheme.colorScheme.surface
-    val onSurface = MaterialTheme.colorScheme.onSurface
     val primary = MaterialTheme.colorScheme.primary
 
     var scale by remember { mutableFloatStateOf(0f) } // 0 = not yet fitted
@@ -176,7 +181,7 @@ fun MapScreen(
                 drawTiles(tiles, scale, panX, panY, size)
             }
 
-            drawMunros(points, scale, panX, panY, selected, bagged, onSurface, primary)
+            drawMunros(points, scale, panX, panY, selected, bagged)
 
             fix?.let { f ->
                 val sx = Mercator.normX(f.lon).toFloat() * scale + panX
@@ -315,8 +320,6 @@ private fun DrawScope.drawMunros(
     panY: Float,
     selected: Munro?,
     bagged: Set<Int>,
-    baseColor: Color,
-    accent: Color,
 ) {
     // Labels once tiles are roughly at native size or larger.
     val showLabels = scale > 700_000f
@@ -337,25 +340,24 @@ private fun DrawScope.drawMunros(
         val radius = (3.5f + ((munro.heightM - 900.0) / 120.0).toFloat()).coerceIn(3.5f, 8f)
         val r = if (isSelected) radius * 1.9f else radius
 
-        // A dark halo so markers stay readable over pale hillshade.
-        drawCircle(Color.Black.copy(alpha = 0.45f), r + 1.8f, Offset(sx, sy))
+        // Amber reads against both pale hillshade and dark ground; the dark
+        // outline keeps it visible if it lands on something bright.
+        val fill = when {
+            isSelected -> SELECTED
+            isBagged -> CLIMBED
+            else -> TO_CLIMB
+        }
 
-        if (isBagged) {
-            drawCircle(
-                color = if (isSelected) accent else accent.copy(alpha = 0.95f),
-                radius = r,
-                center = Offset(sx, sy),
-                style = Stroke(width = 2.2f),
-            )
+        if (isBagged && !isSelected) {
+            // Climbed: hollow, so progress is readable at a glance.
+            drawCircle(OUTLINE, r + 1.6f, Offset(sx, sy), style = Stroke(width = 3.4f))
+            drawCircle(fill, r, Offset(sx, sy), style = Stroke(width = 2.4f))
         } else {
-            drawCircle(
-                color = if (isSelected) accent else Color.White.copy(alpha = 0.9f),
-                radius = r,
-                center = Offset(sx, sy),
-            )
+            drawCircle(OUTLINE, r + 1.6f, Offset(sx, sy))
+            drawCircle(fill, r, Offset(sx, sy))
         }
         if (isSelected) {
-            drawCircle(accent.copy(alpha = 0.3f), r * 2.4f, Offset(sx, sy))
+            drawCircle(SELECTED.copy(alpha = 0.28f), r * 2.6f, Offset(sx, sy))
         }
 
         if (showLabels || isSelected) {
