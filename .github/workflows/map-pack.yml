@@ -63,9 +63,13 @@ jobs:
           gdaldem hillshade -z 2.5 -az 315 -alt 45 -compute_edges \
             -co COMPRESS=DEFLATE -co BIGTIFF=YES \
             dem_3857.tif hillshade.tif
-          # Convert greyscale to RGB so we can burn coloured lines onto it.
-          gdal_translate -expand rgb -co COMPRESS=DEFLATE -co BIGTIFF=YES \
+          # Copy the single grey band three times to make an RGB image we can
+          # burn coloured lines onto. (-expand rgb only works on palettes.)
+          # Left uncompressed and tiled: gdal_rasterize edits this file in
+          # place later, which is unreliable on a compressed TIFF.
+          gdal_translate -b 1 -b 1 -b 1 -co TILED=YES -co BIGTIFF=YES \
             hillshade.tif basemap.tif
+          df -h /
 
       # ---------------------------------------------------------------
       # 3. Contours every 50 m, burnt onto the hillshade.
