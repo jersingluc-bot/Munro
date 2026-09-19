@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,9 +15,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -29,6 +32,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -44,6 +48,7 @@ import kotlinx.coroutines.launch
 import uk.munromap.data.BagStore
 import uk.munromap.data.Fix
 import uk.munromap.data.LocationSource
+import uk.munromap.data.MapLayer
 import uk.munromap.data.MapPack
 import uk.munromap.data.MunroRepository
 import uk.munromap.data.PackState
@@ -69,9 +74,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme(colorScheme = HillScheme) {
-                MunroApp()
-            }
+            MaterialTheme(colorScheme = HillScheme) { MunroApp() }
         }
     }
 }
@@ -88,23 +91,24 @@ private fun MunroApp() {
     var hasPermission by remember { mutableStateOf(LocationSource.hasPermission(context)) }
     var fix by remember { mutableStateOf<Fix?>(null) }
     var tab by remember { mutableIntStateOf(0) }
+    var layer by remember { mutableStateOf(MapLayer.TERRAIN) }
 
-    var packState by remember {
-        mutableStateOf<PackState>(
-            MapPack.existingPath(context)?.let { PackState.Ready(it) } ?: PackState.Missing
-        )
-    }
-
-    // Open the tile database whenever a pack becomes available, and make sure
-    // it gets closed again when this screen goes away.
-    val tiles = remember(packState) {
-        (packState as? PackState.Ready)?.let {
-            runCatching { TileSource(it.path) }.getOrNull()
+    // One download state per layer.
+    val packs = remember {
+        mutableStateMapOf<MapLayer, PackState>().apply {
+            MapLayer.entries.forEach { l ->
+                put(l, MapPack.existingPath(context, l)?.let { PackState.Ready(it) } ?: PackState.Missing)
+            }
         }
     }
-    DisposableEffect(tiles) {
-        onDispose { tiles?.close() }
+
+    val state = packs[layer] ?: PackState.Missing
+
+    // Open the tile database for whichever layer is showing.
+    val tiles = remember(layer, state) {
+        (state as? PackState.Ready)?.let { runCatching { TileSource(it.path) }.getOrNull() }
     }
+    DisposableEffect(tiles) { onDispose { tiles?.close() } }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -114,18 +118,36 @@ private fun MunroApp() {
         if (hasPermission) LocationSource.fixes(context).collect { fix = it }
     }
 
+    fun fetch(target: MapLayer) {
+        scope.launch {
+            packs[target] = PackState.Downloading(0, 0, 0)
+            packs[target] = MapPack.download(context, target) { packs[target] = it }
+        }
+    }
+
     Scaffold { insets ->
         Column(Modifier.fillMaxSize().padding(insets)) {
 
-            MapPackBanner(
-                state = packState,
-                onDownload = {
-                    scope.launch {
-                        packState = PackState.Downloading(0, 0, 0)
-                        packState = MapPack.download(context) { packState = it }
-                    }
-                },
-            )
+            if (tab == 0) {
+                LayerChips(
+                    selected = layer,
+                    stateFor = { packs[it] ?: PackState.Missing },
+                    onSelect = { layer = it },
+                )
+                if (state is PackState.Ready) {
+                    ReplaceLayerRow(
+                        layer = layer,
+                        sizeMb = MapPack.sizeMb(context, layer),
+                        onReplace = { fetch(layer) },
+                    )
+                } else {
+                    PackBanner(
+                        layer = layer,
+                        state = state,
+                        onDownload = { fetch(layer) },
+                    )
+                }
+            }
 
             TabRow(selectedTabIndex = tab) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Map") })
@@ -162,41 +184,67 @@ private fun MunroApp() {
 }
 
 @Composable
-private fun MapPackBanner(state: PackState, onDownload: () -> Unit) {
-    // Nothing to say once the map is in place.
+private fun LayerChips(
+    selected: MapLayer,
+    stateFor: (MapLayer) -> PackState,
+    onSelect: (MapLayer) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        MapLayer.entries.forEach { l ->
+            val downloaded = stateFor(l) is PackState.Ready
+            FilterChip(
+                selected = l == selected,
+                onClick = { onSelect(l) },
+                label = {
+                    Text(
+                        if (downloaded) l.label else "${l.label} \u2193",
+                        fontSize = 13.sp,
+                    )
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun PackBanner(
+    layer: MapLayer,
+    state: PackState,
+    onDownload: () -> Unit,
+) {
+    // A downloaded, working layer needs no banner at all.
     if (state is PackState.Ready) return
 
     Card(
-        modifier = Modifier.fillMaxWidth().padding(10.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
         shape = RoundedCornerShape(14.dp),
     ) {
         Column(Modifier.padding(14.dp)) {
             when (state) {
                 is PackState.Missing -> {
                     Text(
-                        "Map not downloaded",
+                        "${layer.label} map not downloaded",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "335 MB of hillshade, contours and paths for the whole of " +
-                            "Scotland. Use wifi \u2014 this is a big download. Once it's " +
-                            "on the phone it works with no signal.",
+                        "${layer.blurb}. About ${layer.approxMb} MB \u2014 use wifi. " +
+                            "Once downloaded it works with no signal.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Spacer(Modifier.height(10.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        FilledTonalButton(
-                            onClick = onDownload,
-                            shape = RoundedCornerShape(12.dp),
-                        ) { Text("Download map", fontSize = 13.sp) }
+                    FilledTonalButton(onClick = onDownload, shape = RoundedCornerShape(12.dp)) {
+                        Text("Download", fontSize = 13.sp)
                     }
                 }
 
                 is PackState.Downloading -> {
                     Text(
-                        "Downloading map \u2014 ${state.percent}%",
+                        "Downloading ${layer.label} \u2014 ${state.percent}%",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -214,21 +262,39 @@ private fun MapPackBanner(state: PackState, onDownload: () -> Unit) {
 
                 is PackState.Failed -> {
                     Text(
-                        "Map download failed",
+                        "${layer.label} download failed",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(state.reason, style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
-                    FilledTonalButton(
-                        onClick = onDownload,
-                        shape = RoundedCornerShape(12.dp),
-                    ) { Text("Try again", fontSize = 13.sp) }
+                    FilledTonalButton(onClick = onDownload, shape = RoundedCornerShape(12.dp)) {
+                        Text("Try again", fontSize = 13.sp)
+                    }
                 }
 
                 is PackState.Ready -> Unit
             }
+        }
+    }
+}
+
+/** Shown once a layer is in place, so a rebuilt pack can be pulled again. */
+@Composable
+private fun ReplaceLayerRow(layer: MapLayer, sizeMb: Long, onReplace: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "${layer.label}: ${sizeMb} MB on phone",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(Modifier.width(8.dp))
+        FilledTonalButton(onClick = onReplace, shape = RoundedCornerShape(12.dp)) {
+            Text("Replace", fontSize = 12.sp)
         }
     }
 }
