@@ -1,0 +1,202 @@
+name: Build OSM pack
+
+# Flat road-and-path map, as an alternative to the terrain layer.
+# Heavy; start it by hand from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      max_zoom:
+        description: 'Maximum zoom level (12 recommended)'
+        required: true
+        default: '12'
+
+jobs:
+  build-osm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install GDAL, osmium and spatialite
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdal-bin osmium-tool python3-gdal \
+            libsqlite3-mod-spatialite
+          gdalinfo --version
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      # Same extent and resolution as the terrain pack, so the two layers
+      # line up exactly and you can switch between them without the map
+      # shifting under you.
+      - name: Work out the canvas
+        run: |
+          python3 - <<'PY' > extent.sh
+          import math
+          R = 20037508.342789244
+          def x(lon): return lon * R / 180.0
+          def y(lat): return math.log(math.tan((90 + lat) * math.pi / 360.0)) * R / math.pi
+          west, east = -8.0, -1.5
+          south, north = 55.4, 59.0
+          res = 30.0
+          w = int((x(east) - x(west)) / res)
+          h = int((y(north) - y(south)) / res)
+          print(f"export ULX={x(west):.2f} ULY={y(north):.2f}")
+          print(f"export LRX={x(east):.2f} LRY={y(south):.2f}")
+          print(f"export W={w} H={h}")
+          PY
+          cat extent.sh
+          source extent.sh
+          echo "canvas ${W} x ${H}"
+
+      - name: Create the paper background
+        run: |
+          source extent.sh
+          # Pale paper colour, the way a printed map starts.
+          gdal_create -outsize $W $H -bands 3 \
+            -burn 244 -burn 242 -burn 235 \
+            -a_srs EPSG:3857 -a_ullr $ULX $ULY $LRX $LRY \
+            -co TILED=YES -co BIGTIFF=YES osmbase.tif
+          gdalinfo osmbase.tif | head -12
+
+      # The sea isn't a polygon in raw OSM, so it's taken from the elevation
+      # model instead: anything at or below sea level gets painted as water.
+      - name: Paint the sea from elevation
+        run: |
+          source extent.sh
+          mkdir -p dem
+          base=https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com
+          for lat in 55 56 57 58; do
+            for lon in 01 02 03 04 05 06 07 08; do
+              name=Copernicus_DSM_COG_10_N${lat}_00_W0${lon}_00_DEM
+              curl -sfL "$base/$name/$name.tif" -o "dem/$name.tif" || true
+            done
+          done
+          gdalbuildvrt dem.vrt dem/*.tif
+          gdalwarp -t_srs EPSG:3857 -te $ULX $LRY $LRX $ULY -ts $W $H \
+            -r bilinear -co COMPRESS=DEFLATE -co BIGTIFF=YES dem.vrt dem_grid.tif
+
+          # Sea mask: 1 where the ground is at or below sea level.
+          gdal_calc.py -A dem_grid.tif --calc="(A<=0)" --type=Byte \
+            --NoDataValue=none --co COMPRESS=DEFLATE --outfile=sea.tif
+
+          # Blend the water colour in band by band. Polygonising the sea and
+          # rasterising it back would work too, but takes hours at this size.
+          for spec in "1 170" "2 200" "3 220"; do
+            set -- $spec
+            gdal_calc.py -A osmbase.tif --A_band=$1 -B sea.tif \
+              --calc="B*$2 + (1-B)*A" --type=Byte --NoDataValue=none \
+              --co COMPRESS=DEFLATE --outfile=sea_band$1.tif
+          done
+          gdal_merge.py -separate -o osmbase_sea.tif -co TILED=YES -co BIGTIFF=YES \
+            sea_band1.tif sea_band2.tif sea_band3.tif
+          mv osmbase_sea.tif osmbase.tif
+          rm -f sea_band*.tif
+          df -h /
+
+      - name: Extract OSM features
+        run: |
+          curl -sfL -o scotland.osm.pbf \
+            https://download.geofabrik.de/europe/united-kingdom/scotland-latest.osm.pbf
+          ls -lh scotland.osm.pbf
+
+          osmium tags-filter scotland.osm.pbf \
+            natural=water,wood waterway=riverbank landuse=forest \
+            -o areas.osm.pbf --overwrite
+          osmium tags-filter scotland.osm.pbf \
+            w/highway=motorway,trunk,primary \
+            -o major.osm.pbf --overwrite
+          osmium tags-filter scotland.osm.pbf \
+            w/highway=secondary,tertiary,unclassified,residential \
+            -o minor.osm.pbf --overwrite
+          osmium tags-filter scotland.osm.pbf \
+            w/highway=path,footway,track,bridleway,steps \
+            -o paths.osm.pbf --overwrite
+
+      # Lines rasterise one pixel wide, which is invisible at 30 m/px, so
+      # each road class is buffered out to a sensible real-world width first.
+      - name: Buffer and burn the features
+        run: |
+          burn_areas () {
+            ogr2ogr -f GPKG "$2" "$1" multipolygons -t_srs EPSG:3857 -nln shp
+          }
+          burn_lines () {
+            # $1 pbf  $2 out.gpkg  $3 buffer metres
+            ogr2ogr -f GPKG "$2" "$1" lines -t_srs EPSG:3857 -nln raw
+            ogr2ogr -f GPKG "${2%.gpkg}_buf.gpkg" "$2" \
+              -dialect sqlite -nln shp \
+              -sql "SELECT ST_Buffer(geometry, $3) AS geometry FROM raw"
+          }
+
+          burn_areas areas.osm.pbf areas.gpkg
+          gdal_rasterize -burn 150 -burn 185 -burn 155 -l shp areas.gpkg osmbase.tif
+
+          burn_lines paths.osm.pbf paths.gpkg 22
+          gdal_rasterize -burn 176 -burn 96 -burn 60 -l shp paths_buf.gpkg osmbase.tif
+
+          burn_lines minor.osm.pbf minor.gpkg 38
+          gdal_rasterize -burn 250 -burn 244 -burn 200 -l shp minor_buf.gpkg osmbase.tif
+
+          burn_lines major.osm.pbf major.gpkg 65
+          gdal_rasterize -burn 240 -burn 170 -burn 110 -l shp major_buf.gpkg osmbase.tif
+
+          # Light contours last, so the shape of the ground still reads.
+          gdal_contour -a elev -i 100.0 dem_grid.tif contours.gpkg
+          gdal_rasterize -burn 214 -burn 206 -burn 190 -l contour \
+            contours.gpkg osmbase.tif
+          df -h /
+
+      - name: Cut tiles
+        run: |
+          gdal2tiles.py --xyz --zoom=7-${{ inputs.max_zoom }} \
+            --processes=4 --resampling=average -w none \
+            osmbase.tif tiles/
+          du -sh tiles
+
+      - name: Pack into MBTiles
+        run: |
+          python3 - <<'PY'
+          import os, sqlite3, glob
+          con = sqlite3.connect("scotland-osm.mbtiles")
+          cur = con.cursor()
+          cur.execute("CREATE TABLE metadata (name text, value text)")
+          cur.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, "
+                      "tile_row integer, tile_data blob)")
+          for k, v in [("name", "Scotland roads and paths"), ("format", "png"),
+                       ("type", "baselayer"), ("version", "1"),
+                       ("description", "OSM roads, tracks, water and woodland")]:
+              cur.execute("INSERT INTO metadata VALUES (?,?)", (k, v))
+          n = 0
+          for path in glob.glob("tiles/*/*/*.png"):
+              z, x, y = path.split(os.sep)[1:4]
+              z, x = int(z), int(x)
+              y = int(y.removesuffix(".png"))
+              tms_y = (1 << z) - 1 - y
+              with open(path, "rb") as fh:
+                  cur.execute("INSERT INTO tiles VALUES (?,?,?,?)", (z, x, tms_y, fh.read()))
+              n += 1
+          cur.execute("CREATE UNIQUE INDEX tile_index ON tiles "
+                      "(zoom_level, tile_column, tile_row)")
+          con.commit()
+          con.close()
+          print(f"packed {n} tiles")
+          PY
+          ls -lh scotland-osm.mbtiles
+
+      - name: Publish as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: osm-pack-z${{ inputs.max_zoom }}
+          name: Scotland roads and paths (zoom 7-${{ inputs.max_zoom }})
+          body: |
+            Flat map of roads, tracks, paths, water and woodland for Scotland,
+            with light 100 m contours. Same grid as the terrain pack.
+
+            Roads and areas: OpenStreetMap contributors, ODbL.
+            Sea mask and contours: Copernicus GLO-30 DEM.
+          files: scotland-osm.mbtiles
+          fail_on_unmatched_files: true
