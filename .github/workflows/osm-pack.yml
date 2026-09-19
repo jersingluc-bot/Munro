@@ -226,25 +226,25 @@ jobs:
           }
 
           burn_areas water.osm.pbf water.gpkg
-          gdal_rasterize -burn 160 -burn 200 -burn 222 -l shp water.gpkg osmbase.tif
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 160 -burn 200 -burn 222 -l shp water.gpkg osmbase.tif
 
           # Tracks: brown, wide enough to read at a glance.
           burn_lines tracks.osm.pbf tracks 40
-          gdal_rasterize -burn 150 -burn 110 -burn 72 -l shp tracks_buf.gpkg osmbase.tif
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 150 -burn 110 -burn 72 -l shp tracks_buf.gpkg osmbase.tif
 
           # Foot paths: the ones that matter on the hill, so drawn boldest.
           burn_lines paths.osm.pbf paths 38
-          gdal_rasterize -burn 198 -burn 74 -burn 84 -l shp paths_buf.gpkg osmbase.tif
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 198 -burn 74 -burn 84 -l shp paths_buf.gpkg osmbase.tif
 
           burn_lines minor.osm.pbf minor 48
-          gdal_rasterize -burn 250 -burn 212 -burn 130 -l shp minor_buf.gpkg osmbase.tif
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 250 -burn 212 -burn 130 -l shp minor_buf.gpkg osmbase.tif
 
           burn_lines major.osm.pbf major 70
-          gdal_rasterize -burn 232 -burn 124 -burn 56 -l shp major_buf.gpkg osmbase.tif
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 232 -burn 124 -burn 56 -l shp major_buf.gpkg osmbase.tif
 
           # Contours last, dark enough to actually see on white paper.
           gdal_contour -a elev -i 100.0 dem_grid.tif contours.gpkg
-          gdal_rasterize -burn 206 -burn 178 -burn 138 -l contour \
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 206 -burn 178 -burn 138 -l contour \
             contours.gpkg osmbase.tif
           df -h /
 

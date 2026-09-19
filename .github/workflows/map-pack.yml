@@ -86,9 +86,8 @@ jobs:
           gdaldem color-relief dem_3857.tif ramp.txt colour.tif \
             -co COMPRESS=DEFLATE -co BIGTIFF=YES
 
-          # Multiply colours by the hillshade so relief still reads. Output is
-          # uncompressed and tiled: gdal_rasterize edits it in place later,
-          # which is unreliable on a compressed TIFF.
+          # Multiply the colours by the hillshade so the relief shows through.
+          # 0.40 keeps shadowed slopes dark but still legible.
           gdal_calc.py -A colour.tif -B hillshade.tif --allBands=A \
             --calc="A*(0.40+0.60*B/255.0)" --type=Byte --NoDataValue=none \
             --co TILED=YES --co BIGTIFF=YES --outfile=basemap.tif
@@ -101,7 +100,7 @@ jobs:
         run: |
           gdal_contour -a elev -i 50.0 dem_3857.tif contours.gpkg
           ogrinfo -so contours.gpkg contour | head -10
-          gdal_rasterize -burn 120 -burn 90 -burn 60 -l contour \
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 120 -burn 90 -burn 60 -l contour \
             contours.gpkg basemap.tif
 
       # ---------------------------------------------------------------
@@ -122,7 +121,7 @@ jobs:
             -t_srs EPSG:3857 -nln paths
           ogrinfo -so paths.gpkg paths | head -10
 
-          gdal_rasterize -burn 200 -burn 60 -burn 40 -l paths \
+          gdal_rasterize -b 1 -b 2 -b 3 -burn 200 -burn 60 -burn 40 -l paths \
             paths.gpkg basemap.tif
 
       # ---------------------------------------------------------------
