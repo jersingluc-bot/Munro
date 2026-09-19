@@ -126,10 +126,14 @@ jobs:
           }
           burn_lines () {
             # $1 pbf  $2 out.gpkg  $3 buffer metres
-            ogr2ogr -f GPKG "$2" "$1" lines -t_srs EPSG:3857 -nln raw
+            # GEOMETRY_NAME is set explicitly because GPKG defaults the column
+            # to "geom", and the buffer query below has to name it correctly.
+            ogr2ogr -f GPKG "$2" "$1" lines -t_srs EPSG:3857 -nln raw \
+              -lco GEOMETRY_NAME=geom
             ogr2ogr -f GPKG "${2%.gpkg}_buf.gpkg" "$2" \
-              -dialect sqlite -nln shp \
-              -sql "SELECT ST_Buffer(geometry, $3) AS geometry FROM raw"
+              -dialect sqlite -nln shp -lco GEOMETRY_NAME=geom \
+              -sql "SELECT ST_Buffer(geom, $3) AS geom FROM raw"
+            ogrinfo -so "${2%.gpkg}_buf.gpkg" shp | grep -i "feature count" || true
           }
 
           burn_areas areas.osm.pbf areas.gpkg
