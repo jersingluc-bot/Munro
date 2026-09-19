@@ -44,45 +44,46 @@ fun NearbyScreen(
     bagged: Set<Int>,
     onToggleBagged: (Int) -> Unit,
     modifier: Modifier = Modifier,
-    ) {
+) {
     var remainingOnly by remember { mutableStateOf(false) }
 
     Column(modifier.fillMaxSize()) {
 
+        // Progress header stays visible even without a GPS fix.
         Column(Modifier.padding(horizontal = 20.dp, vertical = 14.dp)) {
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
-                ) {
+            ) {
                 Text(
                     "${bagged.size} of ${munros.size} climbed",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
-                    )
+                )
                 Text(
                     "${munros.size - bagged.size} to go",
                     style = MaterialTheme.typography.bodyMedium,
-                    )
+                )
             }
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(
                 progress = { if (munros.isEmpty()) 0f else bagged.size.toFloat() / munros.size },
                 modifier = Modifier.fillMaxWidth(),
-                )
+            )
             Spacer(Modifier.height(12.dp))
             Row {
                 FilterChip(
                     selected = !remainingOnly,
                     onClick = { remainingOnly = false },
                     label = { Text("All", fontSize = 13.sp) },
-                    )
+                )
                 Spacer(Modifier.width(8.dp))
                 FilterChip(
                     selected = remainingOnly,
                     onClick = { remainingOnly = true },
                     label = { Text("Still to do", fontSize = 13.sp) },
-                    )
+                )
             }
         }
         HorizontalDivider()
@@ -91,14 +92,15 @@ fun NearbyScreen(
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
                     if (!hasPermission) {
-                        "Location permission is off, so nothing can be sorted by distance."
+                        "Location permission is off, so nothing can be sorted by distance.\n\n" +
+                            "Tap \"Enable location\" on the map tab."
                     } else {
-                        "Waiting for a GPS fix. Go outside; this can take a minute or two."
+                        "Waiting for a GPS fix.\n\nGo outside; this can take a minute or two."
                     },
                     style = MaterialTheme.typography.bodyLarge,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(32.dp),
-                    )
+                )
             }
             return@Column
         }
@@ -111,34 +113,34 @@ fun NearbyScreen(
                 val isBagged = entry.munro.id in bagged
                 Row(
                     modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onToggleBagged(entry.munro.id) }
-                    .padding(start = 8.dp, end = 20.dp, top = 6.dp, bottom = 6.dp),
+                        .fillMaxWidth()
+                        .clickable { onToggleBagged(entry.munro.id) }
+                        .padding(start = 8.dp, end = 20.dp, top = 6.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    ) {
+                ) {
                     Checkbox(
                         checked = isBagged,
                         onCheckedChange = { onToggleBagged(entry.munro.id) },
-                        )
+                    )
                     Column(Modifier.weight(1f)) {
                         Text(
                             entry.munro.name,
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.Medium,
                             textDecoration = if (isBagged) TextDecoration.LineThrough else null,
-                            )
+                        )
                         Spacer(Modifier.height(2.dp))
                         Text(
-                            "${entry.munro.heightM.toInt()} m - ${entry.munro.region}",
+                            "${entry.munro.heightM.toInt()} m  ·  ${entry.munro.region}",
                             style = MaterialTheme.typography.bodySmall,
-                            )
+                        )
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         Text(
                             formatDistance(entry.distanceKm),
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.SemiBold,
-                            )
+                        )
                         Text(entry.compass, style = MaterialTheme.typography.bodySmall)
                     }
                 }
