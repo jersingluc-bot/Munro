@@ -58,7 +58,7 @@ jobs:
           source extent.sh
           # Pale paper colour, the way a printed map starts.
           gdal_create -outsize $W $H -bands 3 \
-            -burn 244 -burn 242 -burn 235 \
+            -burn 250 -burn 246 -burn 234 \
             -a_srs EPSG:3857 -a_ullr $ULX $ULY $LRX $LRY \
             -co TILED=YES -co BIGTIFF=YES osmbase.tif
           gdalinfo osmbase.tif | head -12
@@ -86,7 +86,7 @@ jobs:
 
           # Blend the water colour in band by band. Polygonising the sea and
           # rasterising it back would work too, but takes hours at this size.
-          for spec in "1 170" "2 200" "3 220"; do
+          for spec in "1 176" "2 206" "3 226"; do
             set -- $spec
             gdal_calc.py -A osmbase.tif --A_band=$1 -B sea.tif \
               --calc="B*$2 + (1-B)*A" --type=Byte --NoDataValue=none \
@@ -105,52 +105,146 @@ jobs:
           ls -lh scotland.osm.pbf
 
           osmium tags-filter scotland.osm.pbf \
-            natural=water,wood waterway=riverbank landuse=forest \
-            -o areas.osm.pbf --overwrite
+            natural=water waterway=riverbank \
+            -o water.osm.pbf --overwrite
           osmium tags-filter scotland.osm.pbf \
             w/highway=motorway,trunk,primary \
             -o major.osm.pbf --overwrite
           osmium tags-filter scotland.osm.pbf \
             w/highway=secondary,tertiary,unclassified,residential \
             -o minor.osm.pbf --overwrite
+          # Split these: a landrover track and a hill path are different
+          # things when you're working out how to get to the foot of a hill.
           osmium tags-filter scotland.osm.pbf \
-            w/highway=path,footway,track,bridleway,steps \
+            w/highway=track \
+            -o tracks.osm.pbf --overwrite
+          osmium tags-filter scotland.osm.pbf \
+            w/highway=path,footway,bridleway,steps \
             -o paths.osm.pbf --overwrite
+
+      - name: Extract place names
+        run: |
+          osmium tags-filter scotland.osm.pbf \
+            n/place=city,town,village,hamlet \
+            -o places.osm.pbf --overwrite
+
+          ogr2ogr -f CSV places_raw.csv places.osm.pbf points \
+            -t_srs EPSG:4326 -lco GEOMETRY=AS_XY -select name,place
+
+          python3 - <<'PY'
+          import csv
+          # Rank matters: at low zoom the app shows only the biggest places.
+          rank = {"city": 0, "town": 1, "village": 2, "hamlet": 3}
+          rows = []
+          with open("places_raw.csv", encoding="utf-8") as fh:
+              for r in csv.DictReader(fh):
+                  name = (r.get("name") or "").strip()
+                  kind = (r.get("place") or "").strip()
+                  if not name or kind not in rank:
+                      continue
+                  try:
+                      lon, lat = float(r["X"]), float(r["Y"])
+                  except (KeyError, ValueError):
+                      continue
+                  rows.append((rank[kind], name, round(lat, 5), round(lon, 5)))
+
+          rows.sort()
+          with open("places.csv", "w", encoding="utf-8", newline="") as fh:
+              w = csv.writer(fh)
+              w.writerow(["rank", "name", "lat", "lon"])
+              w.writerows(rows)
+
+          from collections import Counter
+          print("places by rank:", Counter(r[0] for r in rows))
+          print("total:", len(rows))
+          if len(rows) < 500:
+              raise SystemExit("FAILED: suspiciously few places")
+          PY
+          ls -lh places.csv
+          head -5 places.csv
 
       # Lines rasterise one pixel wide, which is invisible at 30 m/px, so
       # each road class is buffered out to a sensible real-world width first.
       - name: Buffer and burn the features
         run: |
+          # ST_Buffer via the SQLite dialect needs spatialite wired into GDAL's
+          # SQL layer, which it isn't here: it returns rows with empty geometry,
+          # which rasterise to nothing while still reporting success. GDAL's own
+          # geometry engine is always available, so buffer through that instead.
+          cat > buffer.py <<'PY'
+          import sys
+          from osgeo import ogr
+          ogr.UseExceptions()
+
+          src_path, dst_path, dist = sys.argv[1], sys.argv[2], float(sys.argv[3])
+          src = ogr.Open(src_path)
+          layer = src.GetLayer(0)
+
+          drv = ogr.GetDriverByName("GPKG")
+          dst = drv.CreateDataSource(dst_path)
+          out = dst.CreateLayer("shp", layer.GetSpatialRef(), ogr.wkbPolygon)
+          defn = out.GetLayerDefn()
+
+          kept = skipped = 0
+          out.StartTransaction()
+          for i, feat in enumerate(layer):
+              g = feat.GetGeometryRef()
+              if g is None:
+                  skipped += 1
+                  continue
+              buffered = g.Buffer(dist, 4)
+              if buffered is None or buffered.IsEmpty():
+                  skipped += 1
+                  continue
+              f = ogr.Feature(defn)
+              f.SetGeometry(buffered)
+              out.CreateFeature(f)
+              f = None
+              kept += 1
+              if kept % 50000 == 0:
+                  out.CommitTransaction()
+                  out.StartTransaction()
+          out.CommitTransaction()
+          dst = None
+
+          print(f"{dst_path}: buffered {kept}, skipped {skipped}")
+          if kept == 0:
+              raise SystemExit(f"FAILED: no usable geometry in {src_path}")
+          PY
+
+          burn_lines () {
+            # $1 pbf  $2 name  $3 buffer metres
+            ogr2ogr -f GPKG "$2.gpkg" "$1" lines -t_srs EPSG:3857 -nln raw
+            python3 buffer.py "$2.gpkg" "$2_buf.gpkg" "$3"
+            # Prove there is real geometry before burning it.
+            ogrinfo -so "$2_buf.gpkg" shp | grep -Ei "feature count|extent"
+          }
+
           burn_areas () {
             ogr2ogr -f GPKG "$2" "$1" multipolygons -t_srs EPSG:3857 -nln shp
-          }
-          burn_lines () {
-            # $1 pbf  $2 out.gpkg  $3 buffer metres
-            # GEOMETRY_NAME is set explicitly because GPKG defaults the column
-            # to "geom", and the buffer query below has to name it correctly.
-            ogr2ogr -f GPKG "$2" "$1" lines -t_srs EPSG:3857 -nln raw \
-              -lco GEOMETRY_NAME=geom
-            ogr2ogr -f GPKG "${2%.gpkg}_buf.gpkg" "$2" \
-              -dialect sqlite -nln shp -lco GEOMETRY_NAME=geom \
-              -sql "SELECT ST_Buffer(geom, $3) AS geom FROM raw"
-            ogrinfo -so "${2%.gpkg}_buf.gpkg" shp | grep -i "feature count" || true
+            ogrinfo -so "$2" shp | grep -Ei "feature count|extent"
           }
 
-          burn_areas areas.osm.pbf areas.gpkg
-          gdal_rasterize -burn 150 -burn 185 -burn 155 -l shp areas.gpkg osmbase.tif
+          burn_areas water.osm.pbf water.gpkg
+          gdal_rasterize -burn 160 -burn 200 -burn 222 -l shp water.gpkg osmbase.tif
 
-          burn_lines paths.osm.pbf paths.gpkg 22
-          gdal_rasterize -burn 176 -burn 96 -burn 60 -l shp paths_buf.gpkg osmbase.tif
+          # Tracks: brown, wide enough to read at a glance.
+          burn_lines tracks.osm.pbf tracks 40
+          gdal_rasterize -burn 150 -burn 110 -burn 72 -l shp tracks_buf.gpkg osmbase.tif
 
-          burn_lines minor.osm.pbf minor.gpkg 38
-          gdal_rasterize -burn 250 -burn 244 -burn 200 -l shp minor_buf.gpkg osmbase.tif
+          # Foot paths: the ones that matter on the hill, so drawn boldest.
+          burn_lines paths.osm.pbf paths 38
+          gdal_rasterize -burn 198 -burn 74 -burn 84 -l shp paths_buf.gpkg osmbase.tif
 
-          burn_lines major.osm.pbf major.gpkg 65
-          gdal_rasterize -burn 240 -burn 170 -burn 110 -l shp major_buf.gpkg osmbase.tif
+          burn_lines minor.osm.pbf minor 48
+          gdal_rasterize -burn 250 -burn 212 -burn 130 -l shp minor_buf.gpkg osmbase.tif
 
-          # Light contours last, so the shape of the ground still reads.
+          burn_lines major.osm.pbf major 70
+          gdal_rasterize -burn 232 -burn 124 -burn 56 -l shp major_buf.gpkg osmbase.tif
+
+          # Contours last, dark enough to actually see on white paper.
           gdal_contour -a elev -i 100.0 dem_grid.tif contours.gpkg
-          gdal_rasterize -burn 214 -burn 206 -burn 190 -l contour \
+          gdal_rasterize -burn 206 -burn 178 -burn 138 -l contour \
             contours.gpkg osmbase.tif
           df -h /
 
@@ -197,10 +291,12 @@ jobs:
           tag_name: osm-pack-z${{ inputs.max_zoom }}
           name: Scotland roads and paths (zoom 7-${{ inputs.max_zoom }})
           body: |
-            Flat map of roads, tracks, paths, water and woodland for Scotland,
+            Flat map of roads, hill tracks, foot paths and water for Scotland,
             with light 100 m contours. Same grid as the terrain pack.
 
             Roads and areas: OpenStreetMap contributors, ODbL.
             Sea mask and contours: Copernicus GLO-30 DEM.
-          files: scotland-osm.mbtiles
+          files: |
+            scotland-osm.mbtiles
+            places.csv
           fail_on_unmatched_files: true
